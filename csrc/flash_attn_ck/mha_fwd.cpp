@@ -7,23 +7,25 @@
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
 
-fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
-                                       std::string dtype,
-                                       int head_size,
-                                       bool has_dropout,
-                                       bool has_lse,
-                                       bool enable_alibi)
+fmha_fwd_traits
+get_ck_fmha_fwd_traits(const mask_info &mask,
+                       std::string dtype,
+                       int head_size,
+                       bool has_dropout,
+                       bool has_lse,
+                       bool enable_alibi,
+                       bool is_v_rowmajor)
 {
     return fmha_fwd_traits{head_size,
                            head_size,
                            dtype,
-                           false, // is_group_mode
-                           true,  // is_v_rowmajor
+                           false,         // is_group_mode
+                           is_v_rowmajor, // is_v_rowmajor
                            mask.type,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                            has_lse,
                            has_dropout,
-                           false}; // do_fp8_static_quant
+                           dtype == "fp8"}; // do_fp8_static_quant
 }
 
 fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
@@ -45,8 +47,10 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor softmax_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
+                                   float p_scale,
+                                   float o_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t *, uint64_t *> drop_seed_offset)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -81,7 +85,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     void *alibi_slopes_ptr = nullptr;
     ck_tile::index_t stride_alibi_slopes = 0;
 
-    if (alibi_slopes_.has_value()) {
+    if (alibi_slopes_.has_value())
+    {
         auto alibi_slopes = alibi_slopes_.value();
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
@@ -109,8 +114,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          h,             // nhead
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
+                         p_scale,       // scale_p
+                         o_scale,       // scale_o
                          stride_q,
                          stride_k,
                          stride_v,
@@ -142,28 +147,37 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        at::Tensor &v,                            // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         c10::optional<at::Tensor> &out_,          // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
-        const float softmax_scale,
+        float softmax_scale,
+        c10::optional<const float> descale_q_,
+        c10::optional<const float> descale_k_,
+        c10::optional<const float> descale_v_,
         bool is_causal,
         int window_size_left,
         int window_size_right,
         const float /*softcap*/,
         const bool return_dropout_randval,
-        c10::optional<at::Generator> gen_)
+        c10::optional<at::Generator> gen_,
+        bool is_v_rowmajor)
 {
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat8_e4m3fn || q_dtype == torch::kFloat8_e4m3fnuz,
+                "FlashAttention only support fp16, bf16 and fp8 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : q_dtype == torch::kBFloat16 ? "bf16"
+                                                                                                : "fp8";
+    const bool use_fp8 = q_dtype_str == "fp8";
 
-    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -182,23 +196,35 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    if (window_size_left >= seqlen_k) { window_size_left = -1; }
-    if (window_size_right >= seqlen_k) { window_size_right = -1; }
+    if (window_size_left >= seqlen_k)
+    {
+        window_size_left = -1;
+    }
+    if (window_size_right >= seqlen_k)
+    {
+        window_size_right = -1;
+    }
 
     // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
+    if (seqlen_q == 1 && !alibi_slopes_.has_value())
+    {
+        is_causal = false;
+    }
 
     mask_info mask;
-    if (is_causal) {
+    if (is_causal)
+    {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right = 0;
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
     }
-    else if (window_size_left == -1 && window_size_right == -1) {
+    else if (window_size_left == -1 && window_size_right == -1)
+    {
         mask = mask_info::decode("0", seqlen_q, seqlen_k); // no mask
     }
-    else {
+    else
+    {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
@@ -208,7 +234,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
-    if (seqlenq_ngroups_swapped) {
+    if (seqlenq_ngroups_swapped)
+    {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
@@ -216,21 +243,44 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+    if (is_v_rowmajor)
+    {
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+    }
+    else
+    {
+        CHECK_SHAPE(v, batch_size, head_size, num_heads_k, seqlen_k);
+    }
 
     at::Tensor out;
-    if (out_.has_value()) {
+    if (out_.has_value())
+    {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        if (!use_fp8)
+        {
+            TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        }
+        else
+        {
+            TORCH_CHECK(out.dtype() == torch::kFloat16, "Output must fp16 for fp8 inputs");
+        }
+
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
-        if (seqlenq_ngroups_swapped) {
+        if (seqlenq_ngroups_swapped)
+        {
             out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
         }
     }
-    else {
-        out = torch::empty_like(q);
+    else
+    {
+        auto options = torch::TensorOptions().dtype(q_dtype);
+        if (use_fp8)
+        {
+            options = options.dtype(torch::kFloat16);
+        }
+        out = torch::empty_like(q, options);
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -245,19 +295,22 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
 
     at::Tensor p;
-    if (return_dropout_randval) {
+    if (return_dropout_randval)
+    {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
         p = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, opts.dtype(torch::kUInt8));
     }
-    else {
-        p = torch::empty({ 0 }, opts);
+    else
+    {
+        p = torch::empty({0}, opts);
     }
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
-    auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+    auto rng_state_ptr = reinterpret_cast<uint64_t *>(rng_state.data_ptr());
 
-    if (p_dropout > 0.0)  {
+    if (p_dropout > 0.0)
+    {
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -267,7 +320,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
 
-    if (seqlen_k > 0) {
+    if (seqlen_k > 0)
+    {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
@@ -279,7 +333,21 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 head_size,
                 has_dropout,
                 has_lse,
-                alibi_slopes_.has_value());
+                alibi_slopes_.has_value(),
+                is_v_rowmajor);
+
+        float descale_q = descale_q_.has_value() ? descale_q_.value() : 1.0f;
+        float descale_k = descale_k_.has_value() ? descale_k_.value() : 1.0f;
+        float descale_v = descale_v_.has_value() ? descale_v_.value() : 1.0f;
+        constexpr float dtype_max = 240.0f;
+        float p_scale = 1.0f;
+        float o_scale = 1.0f;
+        if (use_fp8)
+        {
+            softmax_scale *= descale_q * descale_k;
+            p_scale = dtype_max;
+            o_scale = descale_v / dtype_max;
+        }
 
         auto args =
             get_ck_fmha_fwd_args(
@@ -300,19 +368,23 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 softmax_lse,
                 p,
                 softmax_scale,
+                p_scale,
+                o_scale,
                 p_dropout,
                 drop_seed_offset);
 
         float t = fmha_fwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
-    else {
+    else
+    {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    if (seqlenq_ngroups_swapped) {
+    if (seqlenq_ngroups_swapped)
+    {
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});

@@ -54,6 +54,13 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
+def check_and_convert_fp8(t, descale):
+    finfo = torch.finfo(torch.float8_e4m3fnuz)
+    return (
+        (t / descale).clamp(min=finfo.min, max=finfo.max).to(torch.float8_e4m3fnuz)
+        if t.dtype != torch.float8_e4m3fnuz
+        else t
+    )
 
 # torch.compile() support is only enabled for pytorch >= 2.4
 # The reason for this is that we are using the new custom_op and register_fake
@@ -85,14 +92,23 @@ def _flash_attn_forward(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    descale_q: Optional[float],
+    descale_k: Optional[float],
+    descale_v: Optional[float],
     causal: bool,
     window_size_left: int,
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
+    is_v_rowmajor: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if descale_q is not None and descale_k is not None and descale_v is not None:
+        q = check_and_convert_fp8(q, descale_q)
+        k = check_and_convert_fp8(k, descale_k)
+        v = check_and_convert_fp8(v, descale_v)
+        
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,
@@ -101,12 +117,16 @@ def _flash_attn_forward(
         alibi_slopes,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size_left,
         window_size_right,
         softcap,
         return_softmax,
         None,
+        is_v_rowmajor,
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -118,6 +138,9 @@ def _flash_attn_forward_fake(
     v: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
+    descale_q: Optional[float],
+    descale_k: Optional[float],
+    descale_v: Optional[float],
     causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -219,7 +242,7 @@ def _flash_attn_varlen_forward_fake(
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
+
     out = torch.empty_like(q)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
@@ -319,7 +342,7 @@ def _flash_attn_backward_fake(
         dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
     softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
@@ -428,7 +451,7 @@ def _flash_attn_varlen_backward_fake(
     if dv is None:
         dv = torch.empty_like(v)
     softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
@@ -445,12 +468,16 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         qkv,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_softmax,
+        is_v_rowmajor,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -460,18 +487,22 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _wrapped_flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
             v,
             dropout_p,
             softmax_scale,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            is_v_rowmajor=is_v_rowmajor,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
@@ -514,7 +545,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -616,12 +647,16 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         kv,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_softmax,
+        is_v_rowmajor,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -637,12 +672,16 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             v,
             dropout_p,
             softmax_scale,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            is_v_rowmajor=is_v_rowmajor,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
@@ -687,7 +726,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -798,12 +837,16 @@ class FlashAttnFunc(torch.autograd.Function):
         v,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_softmax,
+        is_v_rowmajor
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -818,12 +861,16 @@ class FlashAttnFunc(torch.autograd.Function):
             v,
             dropout_p,
             softmax_scale,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            is_v_rowmajor=is_v_rowmajor,
         )
         ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
@@ -867,7 +914,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -973,12 +1020,16 @@ def flash_attn_qkvpacked_func(
     qkv,
     dropout_p=0.0,
     softmax_scale=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # <=0.0 means deactivate
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    is_v_rowmajor=True,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -1018,12 +1069,16 @@ def flash_attn_qkvpacked_func(
         qkv,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        is_v_rowmajor,
     )
 
 
@@ -1032,12 +1087,16 @@ def flash_attn_kvpacked_func(
     kv,
     dropout_p=0.0,
     softmax_scale=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    is_v_rowmajor=True,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If K, V are already stacked into 1 tensor, this function will be faster than
@@ -1095,12 +1154,16 @@ def flash_attn_kvpacked_func(
         kv,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        is_v_rowmajor,
     )
 
 
@@ -1110,12 +1173,16 @@ def flash_attn_func(
     v,
     dropout_p=0.0,
     softmax_scale=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    is_v_rowmajor=True,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1171,12 +1238,16 @@ def flash_attn_func(
         v,
         dropout_p,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size,
         softcap,
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        is_v_rowmajor,
     )
 
 
@@ -1188,7 +1259,7 @@ def flash_attn_varlen_qkvpacked_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1256,7 +1327,7 @@ def flash_attn_varlen_kvpacked_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,

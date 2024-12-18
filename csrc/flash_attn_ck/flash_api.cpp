@@ -7,17 +7,21 @@
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        const at::Tensor &v,                      // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        at::Tensor &v,                            // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         c10::optional<at::Tensor> &out_,          // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
-        const float softmax_scale,
+        float softmax_scale,
+        c10::optional<const float> descale_q,
+        c10::optional<const float> descale_k,
+        c10::optional<const float> descale_v,
         bool is_causal,
         int window_size_left,
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        c10::optional<at::Generator> gen_);
+        c10::optional<at::Generator> gen_,
+        bool is_v_rowmajor);
 
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,                               // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
